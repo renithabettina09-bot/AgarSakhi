@@ -126,6 +126,8 @@ DRYING             ↓
 ```
 
 ---
+<img width="430" height="190" alt="image" src="https://github.com/user-attachments/assets/5601c756-d4d8-4e7e-82ba-17f62b796532" />
+
 
 # 🔥 Drying System
 
