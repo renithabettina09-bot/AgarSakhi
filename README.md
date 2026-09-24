@@ -200,6 +200,9 @@ Chamber condition
 DRYNESS ESTIMATION
 ```
 
+
+
+
 ## Load Cell
 
 A representative sample from the batch can be monitored using a small reference platform.
