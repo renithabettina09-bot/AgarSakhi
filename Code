@@ -1,0 +1,1669 @@
+/*
+ ============================================================
+                    AGARSAKHI
+              ESP32-S3 DRYER CONTROL
+ ============================================================
+
+ BOARD:
+   ESP32-S3
+
+ SENSOR:
+   DHT22
+
+ DISPLAY:
+   SSD1306 OLED 128x64
+   I2C address = 0x3C
+
+ OUTPUTS:
+   Heater Relay
+   Blower Relay
+
+ INPUTS:
+   START Button
+   STOP Button
+
+ ------------------------------------------------------------
+ PIN CONNECTIONS
+ ------------------------------------------------------------
+
+ DHT22 DATA       -> GPIO 4
+
+ OLED SDA         -> GPIO 8
+ OLED SCL         -> GPIO 9
+
+ HEATER RELAY     -> GPIO 25
+ BLOWER RELAY     -> GPIO 26
+
+ START BUTTON     -> GPIO 32
+ STOP BUTTON      -> GPIO 33
+
+ ------------------------------------------------------------
+ RELAY LOGIC
+ ------------------------------------------------------------
+
+ Current Cirkit Designer setup:
+
+ HIGH = ON
+ LOW  = OFF
+
+ Therefore:
+
+ RELAY_ACTIVE_LOW = false
+
+ ------------------------------------------------------------
+ CONTROL THRESHOLDS
+ ------------------------------------------------------------
+
+ Heater ON below       43 C
+ Target temperature    45 C
+ Heater OFF at         47 C
+ High temp fault       50 C
+ Cooling complete      35 C
+ Target humidity       40 %
+
+ ------------------------------------------------------------
+ SIMULATION MODE
+ ------------------------------------------------------------
+
+ SIMULATION_MODE = true
+
+ Cirkit Designer may occasionally fail repeated DHT22
+ transactions.
+
+ In simulation mode, the last valid DHT22 value is retained.
+
+ ------------------------------------------------------------
+ IMPORTANT
+ ------------------------------------------------------------
+
+ The simulated dryness index is time-based.
+
+ In the final prototype it should be replaced by:
+
+       LOAD CELL
+          +
+        HX711
+          +
+   CAPACITIVE SENSOR
+          ↓
+    DRYNESS ALGORITHM
+
+ ============================================================
+*/
+
+
+// ============================================================
+// LIBRARIES
+// ============================================================
+
+#include <Wire.h>
+#include <DHT.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+
+// ============================================================
+// SIMULATION MODE
+// ============================================================
+
+#define SIMULATION_MODE true
+
+
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+
+#define OLED_SDA 8
+#define OLED_SCL 9
+#define OLED_ADDRESS 0x3C
+
+#define HEATER_RELAY 25
+#define BLOWER_RELAY 26
+
+#define START_BUTTON 32
+#define STOP_BUTTON 33
+
+
+// ============================================================
+// RELAY CONFIGURATION
+// ============================================================
+
+// Cirkit Designer relay:
+// HIGH = ON
+// LOW  = OFF
+
+#define RELAY_ACTIVE_LOW false
+
+
+// ============================================================
+// DRYER THRESHOLDS
+// ============================================================
+
+// Temperature at which heater starts
+const float HEATER_ON_TEMP = 43.0;
+
+// Desired operating temperature
+const float TARGET_TEMP = 45.0;
+
+// Temperature at which heater stops
+const float HEATER_OFF_TEMP = 47.0;
+
+// Safety cut-off
+const float HIGH_TEMP_LIMIT = 50.0;
+
+// Cooling must reach this temperature
+const float COOLING_TEMP = 35.0;
+
+// Desired relative humidity
+const float TARGET_RH = 40.0;
+
+
+// ============================================================
+// DRYNESS THRESHOLD
+// ============================================================
+
+// Minimum simulated dryness required
+// before cooling begins.
+
+const float DRYNESS_COMPLETE = 85.0;
+
+
+// ============================================================
+// SIMULATION TIME
+// ============================================================
+
+// For Cirkit Designer demonstration only.
+
+const unsigned long SIMULATION_DRY_TIME =
+  30UL * 1000UL;
+
+
+// ============================================================
+// REAL DRYING TIME
+// ============================================================
+
+// Placeholder minimum time for real prototype.
+// Must be experimentally validated.
+
+const unsigned long REAL_MIN_DRY_TIME =
+  3UL * 60UL * 60UL * 1000UL;
+
+
+// ============================================================
+// DHT VARIABLES
+// ============================================================
+
+float temperature = NAN;
+
+float humidity = NAN;
+
+float lastValidTemperature = NAN;
+
+float lastValidHumidity = NAN;
+
+int dhtFailures = 0;
+
+
+// ============================================================
+// DRYNESS
+// ============================================================
+
+float drynessIndex = 0.0;
+
+
+// ============================================================
+// TIMERS
+// ============================================================
+
+unsigned long lastDHTRead = 0;
+
+unsigned long lastOLEDUpdate = 0;
+
+unsigned long lastSerialUpdate = 0;
+
+unsigned long dryingStartTime = 0;
+
+
+// ============================================================
+// BUTTON STATES
+// ============================================================
+
+bool previousStartButton = HIGH;
+
+bool previousStopButton = HIGH;
+
+
+// ============================================================
+// DRYER STATES
+// ============================================================
+
+enum DryerState
+{
+  IDLE,
+  DRYING,
+  COOLING,
+  PACK_READY,
+  HIGH_TEMP_FAULT,
+  SENSOR_FAULT
+};
+
+DryerState state = IDLE;
+
+
+// ============================================================
+// OLED
+// ============================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+
+// ============================================================
+// DHT22
+// ============================================================
+
+DHT dht(
+  DHT_PIN,
+  DHT_TYPE
+);
+
+
+// ============================================================
+// RELAY CONTROL
+// ============================================================
+
+void relayWrite(
+  int pin,
+  bool turnOn
+)
+{
+  if (RELAY_ACTIVE_LOW)
+  {
+    digitalWrite(
+      pin,
+      turnOn ? LOW : HIGH
+    );
+  }
+  else
+  {
+    digitalWrite(
+      pin,
+      turnOn ? HIGH : LOW
+    );
+  }
+}
+
+
+// ============================================================
+// HEATER ON
+// ============================================================
+
+void heaterON()
+{
+  relayWrite(
+    HEATER_RELAY,
+    true
+  );
+}
+
+
+// ============================================================
+// HEATER OFF
+// ============================================================
+
+void heaterOFF()
+{
+  relayWrite(
+    HEATER_RELAY,
+    false
+  );
+}
+
+
+// ============================================================
+// BLOWER ON
+// ============================================================
+
+void blowerON()
+{
+  relayWrite(
+    BLOWER_RELAY,
+    true
+  );
+}
+
+
+// ============================================================
+// BLOWER OFF
+// ============================================================
+
+void blowerOFF()
+{
+  relayWrite(
+    BLOWER_RELAY,
+    false
+  );
+}
+
+
+// ============================================================
+// STATE NAME
+// ============================================================
+
+const char* getStateName()
+{
+  switch (state)
+  {
+    case IDLE:
+      return "IDLE";
+
+    case DRYING:
+      return "DRYING";
+
+    case COOLING:
+      return "COOLING";
+
+    case PACK_READY:
+      return "PACK READY";
+
+    case HIGH_TEMP_FAULT:
+      return "HIGH TEMP";
+
+    case SENSOR_FAULT:
+      return "SENSOR FAULT";
+  }
+
+  return "UNKNOWN";
+}
+
+
+// ============================================================
+// READ DHT22
+// ============================================================
+
+bool readDHT22()
+{
+  // DHT22 should not be read too frequently.
+
+  if (
+    millis() - lastDHTRead < 2500
+  )
+  {
+    return true;
+  }
+
+
+  lastDHTRead =
+    millis();
+
+
+  float newTemperature =
+    dht.readTemperature();
+
+  float newHumidity =
+    dht.readHumidity();
+
+
+  // ----------------------------------------------------------
+  // VALID READING
+  // ----------------------------------------------------------
+
+  if (
+    !isnan(newTemperature) &&
+    !isnan(newHumidity)
+  )
+  {
+    temperature =
+      newTemperature;
+
+    humidity =
+      newHumidity;
+
+    lastValidTemperature =
+      newTemperature;
+
+    lastValidHumidity =
+      newHumidity;
+
+    dhtFailures = 0;
+
+
+    return true;
+  }
+
+
+  // ----------------------------------------------------------
+  // FAILED READING
+  // ----------------------------------------------------------
+
+  dhtFailures++;
+
+
+  Serial.println(
+    "DHT22 READ FAILED"
+  );
+
+
+  // ----------------------------------------------------------
+  // SIMULATION MODE
+  // ----------------------------------------------------------
+
+  if (SIMULATION_MODE)
+  {
+    /*
+       Cirkit Designer can fail a repeated DHT22
+       transaction.
+
+       Retain the previous valid measurement.
+    */
+
+    if (
+      !isnan(lastValidTemperature)
+    )
+    {
+      temperature =
+        lastValidTemperature;
+    }
+
+    if (
+      !isnan(lastValidHumidity)
+    )
+    {
+      humidity =
+        lastValidHumidity;
+    }
+
+
+    return true;
+  }
+
+
+  // ----------------------------------------------------------
+  // REAL HARDWARE MODE
+  // ----------------------------------------------------------
+
+  if (
+    dhtFailures >= 3
+  )
+  {
+    return false;
+  }
+
+
+  return true;
+}
+
+
+// ============================================================
+// START DRYING
+// ============================================================
+
+void startDrying()
+{
+  Serial.println();
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "        AGARSAKHI START"
+  );
+
+  Serial.println(
+    "======================================"
+  );
+
+
+  // Make sure a valid sensor value exists.
+
+  if (
+    isnan(lastValidTemperature)
+  )
+  {
+    Serial.println(
+      "No valid DHT22 reading."
+    );
+
+    return;
+  }
+
+
+  dryingStartTime =
+    millis();
+
+
+  drynessIndex =
+    0.0;
+
+
+  state =
+    DRYING;
+
+
+  // Blower always operates during drying.
+
+  blowerON();
+
+
+  // Initial heater decision.
+
+  if (
+    temperature < HEATER_ON_TEMP
+  )
+  {
+    heaterON();
+  }
+  else
+  {
+    heaterOFF();
+  }
+
+
+  Serial.println(
+    "DRYING STARTED"
+  );
+}
+
+
+// ============================================================
+// STOP DRYER
+// ============================================================
+
+void stopDryer()
+{
+  heaterOFF();
+
+  blowerOFF();
+
+  state =
+    IDLE;
+
+  drynessIndex =
+    0.0;
+
+
+  Serial.println();
+  Serial.println(
+    "DRYER STOPPED"
+  );
+}
+
+
+// ============================================================
+// TEMPERATURE CONTROL
+// ============================================================
+
+void temperatureControl()
+{
+  // ----------------------------------------------------------
+  // SENSOR VALIDATION
+  // ----------------------------------------------------------
+
+  if (
+    isnan(temperature)
+  )
+  {
+    heaterOFF();
+
+    blowerON();
+
+    state =
+      SENSOR_FAULT;
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // HIGH TEMPERATURE SAFETY
+  // ----------------------------------------------------------
+
+  if (
+    temperature >= HIGH_TEMP_LIMIT
+  )
+  {
+    heaterOFF();
+
+    blowerON();
+
+    state =
+      HIGH_TEMP_FAULT;
+
+
+    Serial.println();
+    Serial.println(
+      "!!! HIGH TEMPERATURE FAULT !!!"
+    );
+
+    Serial.println(
+      "HEATER OFF"
+    );
+
+    Serial.println(
+      "BLOWER ON"
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // HEATER CONTROL
+  // ----------------------------------------------------------
+
+  if (
+    temperature < HEATER_ON_TEMP
+  )
+  {
+    heaterON();
+  }
+
+
+  else if (
+    temperature >= HEATER_OFF_TEMP
+  )
+  {
+    heaterOFF();
+  }
+
+
+  // Blower remains ON.
+
+  blowerON();
+}
+
+
+// ============================================================
+// UPDATE DRYNESS
+// ============================================================
+
+void updateDryness()
+{
+  if (
+    state != DRYING
+  )
+  {
+    return;
+  }
+
+
+  unsigned long elapsed =
+    millis() - dryingStartTime;
+
+
+  // ----------------------------------------------------------
+  // SIMULATION
+  // ----------------------------------------------------------
+
+  if (SIMULATION_MODE)
+  {
+    drynessIndex =
+      (
+        (float)elapsed /
+        (float)SIMULATION_DRY_TIME
+      )
+      * 100.0;
+  }
+
+
+  // Limit to 100%.
+
+  if (
+    drynessIndex > 100.0
+  )
+  {
+    drynessIndex =
+      100.0;
+  }
+}
+
+
+// ============================================================
+// DRYING COMPLETE
+// ============================================================
+
+bool dryingComplete()
+{
+  unsigned long elapsed =
+    millis() - dryingStartTime;
+
+
+  bool timeOK;
+
+
+  if (SIMULATION_MODE)
+  {
+    timeOK =
+      elapsed >= SIMULATION_DRY_TIME;
+  }
+  else
+  {
+    timeOK =
+      elapsed >= REAL_MIN_DRY_TIME;
+  }
+
+
+  bool drynessOK =
+    drynessIndex >= DRYNESS_COMPLETE;
+
+
+  return (
+    timeOK &&
+    drynessOK
+  );
+}
+
+
+// ============================================================
+// START COOLING
+// ============================================================
+
+void startCooling()
+{
+  heaterOFF();
+
+  blowerON();
+
+  state =
+    COOLING;
+
+
+  Serial.println();
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "       DRYING COMPLETE"
+  );
+
+  Serial.println(
+    "       COOLING STARTED"
+  );
+
+  Serial.println(
+    "======================================"
+  );
+}
+
+
+// ============================================================
+// COOLING CONTROL
+// ============================================================
+
+void handleCooling()
+{
+  // Heater must remain OFF.
+
+  heaterOFF();
+
+  // Blower remains ON.
+
+  blowerON();
+
+
+  // When temperature falls sufficiently,
+  // packing is allowed.
+
+  if (
+    !isnan(temperature) &&
+    temperature <= COOLING_TEMP
+  )
+  {
+    state =
+      PACK_READY;
+
+
+    Serial.println();
+    Serial.println(
+      "======================================"
+    );
+
+    Serial.println(
+      "            PACK READY"
+    );
+
+    Serial.println(
+      "======================================"
+    );
+  }
+}
+
+
+// ============================================================
+// BUTTON HANDLING
+// ============================================================
+
+void handleButtons()
+{
+  bool startButton =
+    digitalRead(
+      START_BUTTON
+    );
+
+  bool stopButton =
+    digitalRead(
+      STOP_BUTTON
+    );
+
+
+  // ----------------------------------------------------------
+  // START
+  // ----------------------------------------------------------
+
+  if (
+    previousStartButton == HIGH &&
+    startButton == LOW
+  )
+  {
+    if (
+      state == IDLE
+    )
+    {
+      startDrying();
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // STOP
+  // ----------------------------------------------------------
+
+  if (
+    previousStopButton == HIGH &&
+    stopButton == LOW
+  )
+  {
+    stopDryer();
+  }
+
+
+  // Save current states.
+
+  previousStartButton =
+    startButton;
+
+  previousStopButton =
+    stopButton;
+}
+
+
+// ============================================================
+// OLED DISPLAY
+// ============================================================
+
+void updateOLED()
+{
+  if (
+    millis() - lastOLEDUpdate < 1000
+  )
+  {
+    return;
+  }
+
+
+  lastOLEDUpdate =
+    millis();
+
+
+  display.clearDisplay();
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+  display.setTextSize(1);
+
+
+  // ----------------------------------------------------------
+  // TITLE
+  // ----------------------------------------------------------
+
+  display.setCursor(
+    0,
+    0
+  );
+
+  display.println(
+    "AGARSAKHI"
+  );
+
+
+  // ----------------------------------------------------------
+  // STATE
+  // ----------------------------------------------------------
+
+  display.print(
+    "STATE: "
+  );
+
+  display.println(
+    getStateName()
+  );
+
+
+  // ----------------------------------------------------------
+  // TEMPERATURE
+  // ----------------------------------------------------------
+
+  display.print(
+    "TEMP: "
+  );
+
+  if (
+    isnan(temperature)
+  )
+  {
+    display.println(
+      "--"
+    );
+  }
+  else
+  {
+    display.print(
+      temperature,
+      1
+    );
+
+    display.println(
+      " C"
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // HUMIDITY
+  // ----------------------------------------------------------
+
+  display.print(
+    "RH: "
+  );
+
+  if (
+    isnan(humidity)
+  )
+  {
+    display.println(
+      "--"
+    );
+  }
+  else
+  {
+    display.print(
+      humidity,
+      1
+    );
+
+    display.println(
+      " %"
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // DRYNESS
+  // ----------------------------------------------------------
+
+  display.print(
+    "DRY: "
+  );
+
+  display.print(
+    drynessIndex,
+    0
+  );
+
+  display.println(
+    " %"
+  );
+
+
+  // ----------------------------------------------------------
+  // HEATER STATUS
+  // ----------------------------------------------------------
+
+  bool heaterStatus;
+
+
+  if (RELAY_ACTIVE_LOW)
+  {
+    heaterStatus =
+      digitalRead(
+        HEATER_RELAY
+      ) == LOW;
+  }
+  else
+  {
+    heaterStatus =
+      digitalRead(
+        HEATER_RELAY
+      ) == HIGH;
+  }
+
+
+  display.print(
+    "HEATER: "
+  );
+
+  display.println(
+    heaterStatus ?
+    "ON" :
+    "OFF"
+  );
+
+
+  display.display();
+}
+
+
+// ============================================================
+// SERIAL MONITOR
+// ============================================================
+
+void printStatus()
+{
+  if (
+    millis() - lastSerialUpdate < 3000
+  )
+  {
+    return;
+  }
+
+
+  lastSerialUpdate =
+    millis();
+
+
+  Serial.println();
+  Serial.println(
+    "========== AGARSAKHI STATUS =========="
+  );
+
+
+  Serial.print(
+    "State: "
+  );
+
+  Serial.println(
+    getStateName()
+  );
+
+
+  Serial.print(
+    "Temperature: "
+  );
+
+  if (
+    isnan(temperature)
+  )
+  {
+    Serial.println(
+      "INVALID"
+    );
+  }
+  else
+  {
+    Serial.print(
+      temperature,
+      2
+    );
+
+    Serial.println(
+      " C"
+    );
+  }
+
+
+  Serial.print(
+    "Humidity: "
+  );
+
+  if (
+    isnan(humidity)
+  )
+  {
+    Serial.println(
+      "INVALID"
+    );
+  }
+  else
+  {
+    Serial.print(
+      humidity,
+      2
+    );
+
+    Serial.println(
+      " %"
+    );
+  }
+
+
+  Serial.print(
+    "Dryness Index: "
+  );
+
+  Serial.print(
+    drynessIndex,
+    1
+  );
+
+  Serial.println(
+    " %"
+  );
+
+
+  Serial.print(
+    "DHT Failures: "
+  );
+
+  Serial.println(
+    dhtFailures
+  );
+
+
+  Serial.print(
+    "Heater threshold ON: "
+  );
+
+  Serial.print(
+    HEATER_ON_TEMP
+  );
+
+  Serial.println(
+    " C"
+  );
+
+
+  Serial.print(
+    "Heater threshold OFF: "
+  );
+
+  Serial.print(
+    HEATER_OFF_TEMP
+  );
+
+  Serial.println(
+    " C"
+  );
+
+
+  Serial.print(
+    "High temperature limit: "
+  );
+
+  Serial.print(
+    HIGH_TEMP_LIMIT
+  );
+
+  Serial.println(
+    " C"
+  );
+
+
+  Serial.println(
+    "======================================"
+  );
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+  Serial.begin(
+    115200
+  );
+
+
+  delay(1500);
+
+
+  Serial.println();
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "       AGARSAKHI ESP32-S3"
+  );
+
+  Serial.println(
+    "          DRYER CONTROL"
+  );
+
+  Serial.println(
+    "======================================"
+  );
+
+
+  // ----------------------------------------------------------
+  // RELAY PINS
+  // ----------------------------------------------------------
+
+  pinMode(
+    HEATER_RELAY,
+    OUTPUT
+  );
+
+  pinMode(
+    BLOWER_RELAY,
+    OUTPUT
+  );
+
+
+  // ----------------------------------------------------------
+  // SAFETY STARTUP
+  // ----------------------------------------------------------
+
+  heaterOFF();
+
+  blowerOFF();
+
+
+  // ----------------------------------------------------------
+  // BUTTONS
+  // ----------------------------------------------------------
+
+  pinMode(
+    START_BUTTON,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    STOP_BUTTON,
+    INPUT_PULLUP
+  );
+
+
+  // ----------------------------------------------------------
+  // I2C
+  // ----------------------------------------------------------
+
+  Wire.begin(
+    OLED_SDA,
+    OLED_SCL
+  );
+
+
+  // ----------------------------------------------------------
+  // OLED
+  // ----------------------------------------------------------
+
+  if (
+    !display.begin(
+      SSD1306_SWITCHCAPVCC,
+      OLED_ADDRESS
+    )
+  )
+  {
+    Serial.println(
+      "OLED NOT FOUND"
+    );
+  }
+  else
+  {
+    Serial.println(
+      "OLED detected at 0x3C"
+    );
+
+
+    display.clearDisplay();
+
+    display.setTextSize(1);
+
+    display.setTextColor(
+      SSD1306_WHITE
+    );
+
+    display.setCursor(
+      0,
+      0
+    );
+
+    display.println(
+      "AGARSAKHI"
+    );
+
+    display.println(
+      "ESP32-S3"
+    );
+
+    display.println(
+      "DRYER CONTROL"
+    );
+
+    display.println();
+
+    display.println(
+      "Starting..."
+    );
+
+    display.display();
+
+    delay(1500);
+  }
+
+
+  // ----------------------------------------------------------
+  // DHT22
+  // ----------------------------------------------------------
+
+  dht.begin();
+
+
+  Serial.println(
+    "DHT22 initialized."
+  );
+
+
+  delay(2500);
+
+
+  // ----------------------------------------------------------
+  // INITIAL DHT22 READING
+  // ----------------------------------------------------------
+
+  float t =
+    dht.readTemperature();
+
+  float h =
+    dht.readHumidity();
+
+
+  if (
+    !isnan(t) &&
+    !isnan(h)
+  )
+  {
+    temperature =
+      t;
+
+    humidity =
+      h;
+
+    lastValidTemperature =
+      t;
+
+    lastValidHumidity =
+      h;
+
+
+    Serial.println();
+    Serial.println(
+      "INITIAL DHT22 READING OK"
+    );
+
+
+    Serial.print(
+      "Temperature: "
+    );
+
+    Serial.print(
+      t,
+      2
+    );
+
+    Serial.println(
+      " C"
+    );
+
+
+    Serial.print(
+      "Humidity: "
+    );
+
+    Serial.print(
+      h,
+      2
+    );
+
+    Serial.println(
+      " %"
+    );
+  }
+  else
+  {
+    Serial.println();
+    Serial.println(
+      "INITIAL DHT22 READING FAILED"
+    );
+
+
+    // --------------------------------------------------------
+    // SIMULATION DEFAULT
+    // --------------------------------------------------------
+
+    if (SIMULATION_MODE)
+    {
+      temperature =
+        25.0;
+
+      humidity =
+        60.0;
+
+      lastValidTemperature =
+        25.0;
+
+      lastValidHumidity =
+        60.0;
+
+
+      Serial.println(
+        "Simulation default values:"
+      );
+
+      Serial.println(
+        "Temperature = 25 C"
+      );
+
+      Serial.println(
+        "Humidity = 60 %"
+      );
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // INITIAL STATE
+  // ----------------------------------------------------------
+
+  state =
+    IDLE;
+
+
+  // Safety check
+
+  heaterOFF();
+
+  blowerOFF();
+
+
+  Serial.println();
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "             SYSTEM READY"
+  );
+
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "State  : IDLE"
+  );
+
+  Serial.println(
+    "Heater : OFF"
+  );
+
+  Serial.println(
+    "Blower : OFF"
+  );
+
+  Serial.println(
+    "Press START to begin."
+  );
+}
+
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop()
+{
+  // ----------------------------------------------------------
+  // BUTTONS
+  // ----------------------------------------------------------
+
+  handleButtons();
+
+
+  // ----------------------------------------------------------
+  // DHT22
+  // ----------------------------------------------------------
+
+  bool dhtOK =
+    readDHT22();
+
+
+  // ----------------------------------------------------------
+  // REAL SENSOR FAULT
+  // ----------------------------------------------------------
+
+  if (
+    !dhtOK &&
+    !SIMULATION_MODE &&
+    state == DRYING
+  )
+  {
+    heaterOFF();
+
+    blowerON();
+
+    state =
+      SENSOR_FAULT;
+
+
+    Serial.println(
+      "!!! SENSOR FAULT !!!"
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // SENSOR FAULT
+  // ----------------------------------------------------------
+
+  if (
+    state == SENSOR_FAULT
+  )
+  {
+    heaterOFF();
+
+    blowerON();
+
+    updateOLED();
+
+    printStatus();
+
+    delay(20);
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // HIGH TEMPERATURE FAULT
+  // ----------------------------------------------------------
+
+  if (
+    state == HIGH_TEMP_FAULT
+  )
+  {
+    heaterOFF();
+
+    blowerON();
+
+    updateOLED();
+
+    printStatus();
+
+    delay(20);
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // DRYING
+  // ----------------------------------------------------------
+
+  if (
+    state == DRYING
+  )
+  {
+    temperatureControl();
+
+
+    if (
+      state == DRYING
+    )
+    {
+      updateDryness();
+
+
+      if (
+        dryingComplete()
+      )
+      {
+        startCooling();
+      }
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // COOLING
+  // ----------------------------------------------------------
+
+  if (
+    state == COOLING
+  )
+  {
+    handleCooling();
+  }
+
+
+  // ----------------------------------------------------------
+  // DISPLAY
+  // ----------------------------------------------------------
+
+  updateOLED();
+
+
+  // ----------------------------------------------------------
+  // SERIAL MONITOR
+  // ----------------------------------------------------------
+
+  printStatus();
+
+
+  delay(20);
+}
